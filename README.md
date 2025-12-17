@@ -21,7 +21,7 @@ A cross-distribution backup and restore utility for Linux systems.
 
 ```bash
 # Clone or download the script
-git clone https://github.com/yourusername/backup-restore.git
+git clone https://github.com/luna-co-software/backup-restore
 cd backup-restore
 
 # Make it executable
