@@ -1,0 +1,128 @@
+# backup_restore.sh - Example Configuration File
+#
+# Copy this file to one of these locations:
+#   - ~/.config/backup-restore/config (user config)
+#   - /etc/backup-restore/config (system config)
+#
+# Or specify a custom location:
+#   CONFIG_FILE=/path/to/config ./backup_restore.sh backup
+#
+# All values can also be set via environment variables.
+# Environment variables take precedence over config file values.
+
+# =============================================================================
+# USER CONFIGURATION
+# =============================================================================
+
+# Username to backup (defaults to current user)
+# USER_NAME="username"
+
+# Home directory to backup (defaults to /home/$USER_NAME)
+# HOME_DIR="/home/username"
+
+# =============================================================================
+# BACKUP LOCATION
+# =============================================================================
+
+# Where backups are stored
+# This can be a local path or a mounted network share
+MOUNT_BASE="/mnt/backup"
+
+# =============================================================================
+# RETENTION POLICY
+# =============================================================================
+
+# Minimum free space to maintain on backup drive (in GB)
+# The script will remove old backups to maintain this much free space
+MIN_FREE_SPACE_GB="50"
+
+# Minimum number of backups to always keep
+# The script will never delete backups below this threshold, even if low on space
+MIN_BACKUPS_TO_KEEP="3"
+
+# Maximum number of backups to keep
+# Oldest backups are removed when this limit is exceeded
+MAX_BACKUPS="30"
+
+# =============================================================================
+# FSTAB CONFIGURATION
+# =============================================================================
+
+# Enable automatic /etc/fstab management for backup drive
+# Set to "false" to disable fstab prompts during restore
+BACKUP_FSTAB_ENABLED="true"
+
+# Mount point for backup drive (used in fstab entry)
+BACKUP_MOUNT_POINT="/mnt/backup"
+
+# fstab mount options for backup drive
+# Adjust filesystem type and options as needed
+BACKUP_FSTAB_OPTIONS="ext4  nofail,x-systemd.automount,x-systemd.idle-timeout=60  0  2"
+
+# =============================================================================
+# NAS/CIFS CONFIGURATION (Optional)
+# =============================================================================
+
+# Enable NAS mount configuration
+# Set to "true" to enable NAS-related features
+NAS_ENABLED="false"
+
+# NAS share path (SMB/CIFS format)
+# Example: "//nas.local/backups" or "//192.168.1.100/share"
+NAS_SHARE="//nas.local/share"
+
+# Local mount point for NAS
+NAS_MOUNT_POINT="/mnt/nas"
+
+# Path to CIFS credentials file
+# This file should contain:
+#   username=your_username
+#   password=your_password
+#   domain=WORKGROUP  (optional)
+# IMPORTANT: Set permissions to 600!
+NAS_CREDENTIALS_FILE="/home/username/.config/backup-restore/nas.cred"
+
+# fstab mount options for NAS
+# $NAS_CREDENTIALS_FILE will be substituted automatically
+# uid and gid are added automatically based on USER_NAME
+NAS_FSTAB_OPTIONS="cifs  credentials=\$NAS_CREDENTIALS_FILE,rw,_netdev,noauto,x-systemd.automount  0  0"
+
+# =============================================================================
+# SYSTEMD SERVICE NAMES (Optional)
+# =============================================================================
+
+# Custom service and timer names if you want to use different names
+# SERVICE_NAME="home-backup.service"
+# TIMER_NAME="home-backup.timer"
+
+# =============================================================================
+# EXCLUSIONS
+# =============================================================================
+
+# Patterns to exclude from home directory backup
+# These are passed directly to tar/rsync
+# Uncomment and modify to customize exclusions
+#
+# EXCLUDE=(
+#   "--exclude=.cache"
+#   "--exclude=.local/share/Trash"
+#   "--exclude=.local/share/Steam"
+#   "--exclude=Downloads"
+#   "--exclude=*.tmp"
+#   "--exclude=*.bak"
+#   "--exclude=.npm"
+#   "--exclude=.cargo"
+#   "--exclude=node_modules"
+#   "--exclude=.venv"
+#   "--exclude=__pycache__"
+# )
+
+# =============================================================================
+# ADVANCED OPTIONS
+# =============================================================================
+
+# Enable dry-run mode by default (for testing)
+# DRY_RUN="false"
+
+# Enable selective restore by default
+# SELECTIVE="false"

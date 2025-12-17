@@ -1,0 +1,28 @@
+# Credentials - NEVER commit these
+*.cred
+nas.cred
+credentials
+*.credentials
+
+# User config files (may contain sensitive paths)
+config
+!config.example
+
+# Backup logs
+*.log
+backup.log
+
+# Editor files
+*.swp
+*.swo
+*~
+.*.swp
+
+# IDE files
+.idea/
+.vscode/
+*.sublime-*
+
+# OS files
+.DS_Store
+Thumbs.db
