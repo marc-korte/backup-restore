@@ -45,6 +45,30 @@ MIN_BACKUPS_TO_KEEP="3"
 MAX_BACKUPS="30"
 
 # =============================================================================
+# RESTIC CONFIGURATION
+# =============================================================================
+
+# restic is used automatically for the home directory backup when the restic
+# binary is installed and the password file below exists. Set to "false" to
+# force the legacy rsync/tar path.
+# RESTIC_ENABLED="true"
+
+# Repository location (defaults to $MOUNT_BASE/restic-repo)
+# RESTIC_REPO="/mnt/backup/restic-repo"
+
+# Repository password file. Create with:
+#   sudo mkdir -p /etc/backup-restore
+#   sudo sh -c 'openssl rand -base64 32 > /etc/backup-restore/restic.pass && chmod 600 /etc/backup-restore/restic.pass'
+# WARNING: losing this file makes all restic backups permanently unreadable.
+# Keep a copy of the password in a password manager.
+# RESTIC_PASSWORD_FILE="/etc/backup-restore/restic.pass"
+
+# Snapshot retention (applied with 'restic forget --prune' after each backup)
+# RESTIC_KEEP_DAILY="7"
+# RESTIC_KEEP_WEEKLY="4"
+# RESTIC_KEEP_MONTHLY="6"
+
+# =============================================================================
 # FSTAB CONFIGURATION
 # =============================================================================
 
@@ -96,11 +120,46 @@ NAS_FSTAB_OPTIONS="cifs  credentials=\$NAS_CREDENTIALS_FILE,rw,_netdev,noauto,x-
 # TIMER_NAME="home-backup.timer"
 
 # =============================================================================
+# PRESERVED SYSTEM FILES (Optional)
+# =============================================================================
+
+# Hand-written system files that no package owns (plus /etc/default/grub, which
+# is package-owned but %config, so a reinstall reverts it to stock). A snapper
+# rollback wipes these silently and the damage surfaces much later as a boot,
+# audio, suspend, or hardware fault with no obvious cause. Listed files are
+# copied into the backup and put back by the "system config" restore; missing
+# ones are skipped quietly but reported in the log.
+#
+# The built-in list covers this machine's known-fragile set: GRUB kernel pinning,
+# realtime audio limits, per-kernel SMT setup, S3 resume workarounds, the iwlwifi
+# recovery service, shutdown timeout drop-ins, zram tuning, and the Supernote
+# tablet fix. Paths outside /etc are fine -- /usr/local/bin/rt-audio-setup is in
+# there because a rollback reverts that too.
+#
+# Setting this REPLACES the built-in list, so include the defaults you still want.
+#
+# Restore re-runs whatever has to consume each file type: systemd-hwdb update and
+# a udev reload for hwdb/rules (replug the device afterwards -- hwdb applies at
+# device-add time), daemon-reload for units, systemd-tmpfiles --create, and
+# sysctl --system. /etc/default/grub is restored but grub.cfg is deliberately NOT
+# regenerated; the restore log tells you to review it and run grub2-mkconfig.
+#
+# PRESERVE_FILES=(
+#   /etc/default/grub
+#   /etc/security/limits.d/99-realtime.conf
+#   /etc/systemd/system/rt-audio-setup.service
+#   /usr/local/bin/rt-audio-setup
+#   /etc/udev/hwdb.d/61-supernote-manta.hwdb
+#   /etc/libwacom/supernote-manta.tablet
+# )
+
+# =============================================================================
 # EXCLUSIONS
 # =============================================================================
 
 # Patterns to exclude from home directory backup
-# These are passed directly to tar/rsync
+# These are passed directly to tar/rsync; for restic, plain paths are
+# anchored to $HOME_DIR and glob patterns (e.g. *.tmp) apply everywhere
 # Uncomment and modify to customize exclusions
 #
 # EXCLUDE=(

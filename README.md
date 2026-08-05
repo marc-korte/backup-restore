@@ -5,10 +5,10 @@ A cross-distribution backup and restore utility for Linux systems.
 ## Features
 
 - **Multi-distribution support**: Fedora, Ubuntu/Debian, openSUSE (including Leap 16+)
-- **Smart retention policy**: Automatically manages disk space by removing old backups
-- **Incremental backups**: Uses rsync with hard-links for efficient storage on local filesystems
-- **CIFS/NAS support**: Falls back to tar archives to preserve metadata on network shares
-- **Checksum verification**: SHA256 checksums for backup integrity verification
+- **restic-based home backups** (preferred): deduplicated, compressed, encrypted snapshots with built-in integrity verification — fast even over CIFS/NAS
+- **Legacy fallback**: rsync with hard-links (local) or tar archives (CIFS) when restic is not available
+- **Smart retention policy**: snapshot pruning via restic (daily/weekly/monthly), plus disk-space management for legacy backup directories
+- **Checksum verification**: `restic check` after every backup; SHA256 checksums for legacy/metadata files
 - **Flatpak support**: Backs up and restores Flatpak applications
 - **Package management**: Exports and restores system packages per distribution
 - **Systemd integration**: Can set up automated backups with systemd timers
@@ -93,6 +93,15 @@ NAS_SHARE="//nas.local/share"
 NAS_MOUNT_POINT="/mnt/nas"
 NAS_CREDENTIALS_FILE="/home/username/.config/backup-restore/nas.cred"
 
+# restic configuration (used automatically when restic is installed
+# and the password file exists)
+RESTIC_ENABLED="true"
+RESTIC_REPO="$MOUNT_BASE/restic-repo"
+RESTIC_PASSWORD_FILE="/etc/backup-restore/restic.pass"
+RESTIC_KEEP_DAILY="7"
+RESTIC_KEEP_WEEKLY="4"
+RESTIC_KEEP_MONTHLY="6"
+
 # Custom exclusions (optional)
 EXCLUDE=(
   "--exclude=.cache"
@@ -146,8 +155,12 @@ sudo ./backup_restore.sh --selective restore
 ### What Gets Backed Up
 
 1. **Home directory** (`/home/username/`)
-   - Uses rsync with hard-links for incremental backups
-   - Falls back to tar archive on CIFS/NAS mounts
+   - **restic** (preferred): deduplicated, compressed, encrypted snapshots in
+     `$RESTIC_REPO`. Only changed data is uploaded after the first run, so
+     nightly backups take minutes instead of hours. `--one-file-system` keeps
+     FUSE mounts (e.g. rclone cloud mounts) out of the snapshot.
+   - Legacy fallback when restic is unavailable: rsync with hard-links on
+     local filesystems, tar archive on CIFS/NAS mounts
    - Preserves permissions, xattrs, ACLs, and SELinux contexts
 
 2. **Package list** (`packages.txt`)
@@ -172,7 +185,9 @@ sudo ./backup_restore.sh --selective restore
 When using `--selective`, you can choose to restore:
 
 1. **Packages only** - Reinstall system packages
-2. **Home directory only** - Restore user files
+2. **Home directory only** - Restore user files (from the latest restic
+   snapshot when a repository exists; otherwise from the legacy tar/rsync
+   backup)
 3. **Flatpaks only** - Reinstall Flatpak applications
 4. **System config** - Repos, systemd units, fstab entries
 5. **Everything** - Full restore
@@ -231,9 +246,51 @@ systemctl list-timers home-backup.timer
 journalctl -u home-backup.service
 ```
 
+## restic Setup
+
+restic is the preferred backup engine. To enable it:
+
+```bash
+# Install restic (openSUSE: zypper, Fedora: dnf, Ubuntu/Debian: apt)
+sudo zypper install restic
+
+# Create the repository password file
+sudo mkdir -p /etc/backup-restore
+sudo sh -c 'openssl rand -base64 32 > /etc/backup-restore/restic.pass && chmod 600 /etc/backup-restore/restic.pass'
+```
+
+The script detects restic + password file automatically and initializes the
+repository on first backup. No other setup needed.
+
+> **WARNING:** The restic repository is encrypted with this password. If the
+> password file is lost, all backups become permanently unreadable. Store a
+> copy of the password in a password manager or other safe location that does
+> not live on the machine being backed up.
+
+After every backup the script runs `restic forget` (retention) and
+`restic check` (integrity verification) automatically.
+
+### Useful restic commands
+
+```bash
+export RESTIC_REPOSITORY=/mnt/backup/restic-repo
+export RESTIC_PASSWORD_FILE=/etc/backup-restore/restic.pass
+
+sudo -E restic snapshots          # list all snapshots
+sudo -E restic ls latest          # list files in the latest snapshot
+sudo -E restic mount /mnt/restic  # browse snapshots as a filesystem
+sudo -E restic restore latest --target / --path /home/username  # restore home
+sudo -E restic check --read-data-subset=5%  # deep integrity check (slow)
+```
+
 ## Smart Retention Policy
 
-The script automatically manages backup retention:
+**restic snapshots** are pruned after every backup according to
+`RESTIC_KEEP_DAILY` / `RESTIC_KEEP_WEEKLY` / `RESTIC_KEEP_MONTHLY`
+(defaults: 7 daily, 4 weekly, 6 monthly).
+
+**Legacy backup directories** (and the small per-run metadata directories)
+are managed separately:
 
 1. **Maximum limit**: Removes oldest backups when `MAX_BACKUPS` is exceeded
 2. **Space management**: Removes oldest backups to maintain `MIN_FREE_SPACE_GB`
@@ -312,6 +369,22 @@ This indicates potential backup corruption. Options:
 2. Run `./backup_restore.sh menu` and use option 4 to verify checksums
 3. Check disk health on backup media
 
+### restic check reports errors
+
+```bash
+sudo -E restic check --read-data-subset=5%   # verify a sample of actual data
+sudo -E restic repair index                  # rebuild a damaged index
+```
+If errors persist, check the storage backend (NAS disk health, network share
+integrity) before trusting further backups.
+
+### Lost restic password
+
+There is no recovery. The repository is encrypted and unreadable without the
+password file. Start a new repository (`restic init` happens automatically on
+the next backup after you create a new password file) and treat the old one
+as lost.
+
 ### SELinux contexts not preserved
 
 The script automatically detects SELinux and uses appropriate flags. If contexts are wrong after restore:
@@ -324,10 +397,10 @@ sudo restorecon -Rv /home/username
 - bash 4.0+
 - coreutils (standard Linux utilities)
 - tar
-- rsync
 - findutils
 - One of: dnf5/dnf, apt, or zypper (depending on distribution)
-- Optional: flatpak, cifs-utils (for NAS)
+- **Recommended: restic** (preferred backup engine for the home directory)
+- Optional: rsync (legacy fallback), flatpak, cifs-utils (for NAS)
 
 ## License
 

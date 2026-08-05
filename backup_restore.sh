@@ -47,20 +47,34 @@ load_config
 # These can be overridden via config file or environment variables
 
 # User configuration
-USER_NAME="${USER_NAME:-$(whoami)}"
+USER_NAME="${USER_NAME:-marc}"
 HOME_DIR="${HOME_DIR:-/home/$USER_NAME}"
 DRY_RUN="${DRY_RUN:-false}"
 
 # Backup destination
-MOUNT_BASE="${MOUNT_BASE:-/mnt/backup}"
+MOUNT_BASE="${MOUNT_BASE:-/mnt/Backups/BOXX}"
+
+# Dated metadata folders live under this subdir to keep the mount root tidy
+# (alongside restic-repo/, backup.log, README.md).
+META_BASE="${META_BASE:-$MOUNT_BASE/metadata-backup}"
 
 TODAY="$(date +%Y%m%d_%H%M%S)"
-BACKUP_DIR="$MOUNT_BASE/backups/backup_${TODAY}"
+BACKUP_DIR="$META_BASE/backup_${TODAY}"
 
 # Smart retention configuration
 MIN_FREE_SPACE_GB="${MIN_FREE_SPACE_GB:-50}"  # Minimum free space to maintain (GB)
 MIN_BACKUPS_TO_KEEP="${MIN_BACKUPS_TO_KEEP:-3}"  # Never go below this number of backups
 MAX_BACKUPS="${MAX_BACKUPS:-30}"  # Maximum number of backups to keep regardless of space
+
+# Packages whose optional "Recommends" matter on restore. The package list only
+# captures EXPLICITLY-installed packages (zypper i+), and the first install pass
+# uses --no-recommends to stay minimal - so split-out optional modules (e.g.
+# qemu's qemu-hw-display-*, qemu-chardev-spice, qemu-hw-usb-*) get dropped on
+# BOTH sides. After the minimal pass, these metapackages get a second install
+# WITHOUT --no-recommends so their optional pieces return. Space-separated;
+# only entries present in the backup's package list (or already installed) are
+# touched. (openSUSE/Ubuntu only - Fedora's first pass already pulls weak deps.)
+RECOMMENDS_METAPKGS="${RECOMMENDS_METAPKGS:-qemu qemu-x86 virt-manager libvirt-daemon-qemu}"
 
 # Filenames (kept stable across distros)
 PKG_LIST="packages.txt"              # names only
@@ -77,6 +91,70 @@ TIMER_SRC="/etc/systemd/system/${TIMER_NAME}"
 SCRIPT_SRC="/usr/local/sbin/backup_restore.sh"
 SYSTEMD_SAVE_DIR="$BACKUP_DIR/systemd"
 BIN_SAVE_DIR="$BACKUP_DIR/bin"
+PRESERVE_SAVE_DIR="$BACKUP_DIR/preserved"
+
+# Hand-written system files that no package owns (plus /etc/default/grub, which
+# is package-owned but %config, so a grub2-common reinstall reverts it to stock).
+# A snapper rollback wipes every one of these silently, and the breakage always
+# surfaces later as a mystery fault with no obvious connection to the rollback.
+#
+# Captured on backup, put back by the "system config" restore. Paths are absolute
+# and recreated verbatim; missing ones are skipped without error. Each entry says
+# WHAT BREAKS without it, because that is the thing you will be trying to work out.
+#
+# Override wholesale by setting PRESERVE_FILES in the config file.
+if [ -z "${PRESERVE_FILES+x}" ]; then
+  PRESERVE_FILES=(
+    # --- Boot / kernel selection ---
+    # GRUB_TOP_LEVEL pins the newest *-default kernel. Without it GRUB version-sorts
+    # the rt kernel above default and every daily boot lands on rt.
+    # Also carries "threadirqs" in GRUB_CMDLINE_LINUX_DEFAULT.
+    /etc/default/grub
+
+    # --- Audio: realtime scheduling and latency ---
+    # RT priority + memlock limits. Losing it costs xruns in Bitwig/Mixbus.
+    /etc/security/limits.d/99-realtime.conf
+    # Pins cpu_dma_latency so the CPU cannot drop into deep C-states mid-session.
+    /etc/udev/rules.d/99-cpu-dma-latency.rules
+    # Per-kernel SMT and governor setup: SMT off under rt, on under default.
+    # The unit is useless without the script, so both are listed.
+    /etc/systemd/system/rt-audio-setup.service
+    /usr/local/bin/rt-audio-setup
+    # Native Instruments Maschine device permissions.
+    /etc/udev/rules.d/71-maschine.rules
+
+    # --- Suspend / resume ---
+    # Writes pm_async=0 at boot. Without it the Vega M resumes to a black screen.
+    /etc/tmpfiles.d/pm_async.conf
+    # Lets the Logitech receiver wake the machine from S3.
+    /etc/udev/rules.d/90-logitech-wake.rules
+
+    # --- WiFi ---
+    # iwlwifi 8265 firmware asserts roughly weekly and can wedge the radio until
+    # a manual rfkill toggle. This service detects the signature and cycles it.
+    /etc/systemd/system/iwlwifi-recover.service
+
+    # --- Shutdown hangs ---
+    # usbmuxd ignored the default stop timeout and added 90s to every shutdown.
+    # The matching user-level DefaultTimeoutStopSec lives in
+    # ~/.config/systemd/user.conf.d/ and rides along with the home backup.
+    /etc/systemd/system/usbmuxd.service.d/50-stop-timeout.conf
+
+    # --- Memory / swap ---
+    # zram tuning for the zram + btrfs swapfile setup.
+    /etc/sysctl.d/99-zram-tune.conf
+
+    # --- This backup system itself ---
+    /etc/systemd/system/home-backup.service.d/override.conf
+
+    # --- Supernote Manta drawing tablet ---
+    # Firmware omits the Unit declaration on the pen's X/Y axes, so hid-input
+    # reports resolution 0 and libinput discards the device outright
+    # ("missing tablet capabilities: resolution"): no cursor, no pressure.
+    /etc/udev/hwdb.d/61-supernote-manta.hwdb
+    /etc/libwacom/supernote-manta.tablet
+  )
+fi
 
 # ===== FSTAB Configuration (Optional) =====
 # Set BACKUP_FSTAB_ENABLED=true to enable backup drive fstab management
@@ -100,7 +178,20 @@ EXCLUDE=(
   "--exclude=Downloads"
   "--exclude=*.tmp"
   "--exclude=*.bak"
+  "--exclude=GoogleDrive"      # rclone FUSE mount (cloud data, not real home files)
 )
+
+# === restic Configuration ===
+# When restic is installed and the password file exists, home is backed up
+# into a restic repository (deduplicated, compressed, encrypted) instead of
+# per-file rsync/tar. Metadata (packages, repos, flatpaks, systemd units)
+# still goes into the dated backup_* directories.
+RESTIC_ENABLED="${RESTIC_ENABLED:-true}"
+RESTIC_REPO="${RESTIC_REPO:-$MOUNT_BASE/restic-repo}"
+RESTIC_PASSWORD_FILE="${RESTIC_PASSWORD_FILE:-/etc/backup-restore/restic.pass}"
+RESTIC_KEEP_DAILY="${RESTIC_KEEP_DAILY:-7}"
+RESTIC_KEEP_WEEKLY="${RESTIC_KEEP_WEEKLY:-4}"
+RESTIC_KEEP_MONTHLY="${RESTIC_KEEP_MONTHLY:-6}"
 
 log() {
   local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
@@ -121,7 +212,7 @@ run_cmd() {
 }
 
 require_cmd() { command -v "$1" >/dev/null 2>&1 || { log "Error: required command '$1' not found"; exit 1; }; }
-ensure_dirs() { mkdir -p "$MOUNT_BASE"; }
+ensure_dirs() { mkdir -p "$MOUNT_BASE" "$META_BASE"; }
 
 require_mount() {
   if [ ! -d "$MOUNT_BASE" ]; then
@@ -138,12 +229,12 @@ require_root_for_system_ops() {
 }
 
 latest_backup_dir() {
-  find "$MOUNT_BASE/backups" -maxdepth 1 -type d -name "backup_*" -printf "%T@ %p\n" 2>/dev/null | sort -nr | cut -d' ' -f2- | head -n1
+  find "$META_BASE" -maxdepth 1 -type d -name "backup_*" -printf "%T@ %p\n" 2>/dev/null | sort -nr | cut -d' ' -f2- | head -n1
 }
 
 previous_backup_dir() {
   local candidates
-  candidates=$(find "$MOUNT_BASE/backups" -maxdepth 1 -type d -name "backup_*" -printf "%T@ %p\n" 2>/dev/null | sort -nr | cut -d' ' -f2-)
+  candidates=$(find "$META_BASE" -maxdepth 1 -type d -name "backup_*" -printf "%T@ %p\n" 2>/dev/null | sort -nr | cut -d' ' -f2-)
   while IFS= read -r d; do
     [ -z "$d" ] && continue
     [ "$d" = "$BACKUP_DIR" ] && continue
@@ -175,6 +266,118 @@ supports_hardlinks() {
   fi
   rm -f "$test_src" "$test_dst"
   log "Hardlink probe: success"
+  return 0
+}
+
+# === restic helpers ===
+restic_available() {
+  [ "$RESTIC_ENABLED" = "true" ] && command -v restic >/dev/null 2>&1 && [ -f "$RESTIC_PASSWORD_FILE" ]
+}
+
+restic_repo_exists() {
+  RESTIC_REPOSITORY="$RESTIC_REPO" RESTIC_PASSWORD_FILE="$RESTIC_PASSWORD_FILE" \
+    restic cat config >/dev/null 2>&1
+}
+
+# On a fresh machine the restic repo is on the backup volume but the password file
+# (the decryption key, deliberately never stored in the backup) does not exist yet.
+# Prompt once for the password, verify it opens the repo, and persist it to
+# RESTIC_PASSWORD_FILE so both this restore AND the scheduled backup timer work.
+# Honors RESTIC_PASSWORD / RESTIC_PASSWORD_FILE if already set in the environment.
+ensure_restic_password() {
+  [ "$RESTIC_ENABLED" = "true" ] || return 0
+  command -v restic >/dev/null 2>&1 || return 0
+  [ -f "$RESTIC_PASSWORD_FILE" ] && return 0          # already have it
+  [ -d "$RESTIC_REPO" ] || return 0                   # no repo present -> nothing to unlock
+  if [ -n "${RESTIC_PASSWORD:-}" ]; then              # password supplied via env
+    mkdir -p "$(dirname "$RESTIC_PASSWORD_FILE")"
+    printf '%s\n' "$RESTIC_PASSWORD" > "$RESTIC_PASSWORD_FILE"
+    chmod 600 "$RESTIC_PASSWORD_FILE"
+    log "Saved restic password from \$RESTIC_PASSWORD to $RESTIC_PASSWORD_FILE"
+    return 0
+  fi
+  if [ "$DRY_RUN" = "true" ]; then
+    log "Would prompt for the restic repository password and save it to $RESTIC_PASSWORD_FILE"
+    return 0
+  fi
+
+  echo
+  echo "A restic repository exists at $RESTIC_REPO but no password file is present at"
+  echo "$RESTIC_PASSWORD_FILE. The password is required to restore your home directory"
+  echo "(and for the scheduled backup timer to run on this machine)."
+  local _rpw=""
+  local _try
+  for _try in 1 2 3; do
+    read -r -s -p "Enter restic repository password (attempt $_try/3): " _rpw; echo
+    [ -n "$_rpw" ] || { echo "  (empty — try again)"; continue; }
+    if RESTIC_REPOSITORY="$RESTIC_REPO" RESTIC_PASSWORD="$_rpw" \
+         restic cat config >/dev/null 2>&1; then
+      mkdir -p "$(dirname "$RESTIC_PASSWORD_FILE")"
+      printf '%s\n' "$_rpw" > "$RESTIC_PASSWORD_FILE"
+      chmod 600 "$RESTIC_PASSWORD_FILE"
+      unset _rpw
+      log "restic password accepted and saved to $RESTIC_PASSWORD_FILE"
+      return 0
+    fi
+    echo "  Password did not open the repository."
+  done
+  unset _rpw
+  log "WARNING: no valid restic password provided; home directory restore will be skipped."
+  return 0
+}
+
+backup_home_restic() {
+  export RESTIC_REPOSITORY="$RESTIC_REPO"
+  export RESTIC_PASSWORD_FILE
+
+  if ! restic_repo_exists; then
+    if [ "$DRY_RUN" = "true" ]; then
+      log "Would initialize restic repository at $RESTIC_REPO"
+      return 0
+    fi
+    log "Initializing restic repository at $RESTIC_REPO"
+    restic init 2>&1 | tee -a "$LOG_FILE" || { log "ERROR: restic init failed"; return 1; }
+  fi
+
+  # Translate EXCLUDE patterns: glob patterns stay global, plain paths are
+  # anchored to $HOME_DIR (matches rsync/tar relative-exclude semantics)
+  local restic_excludes=() pat
+  for pat in "${EXCLUDE[@]}"; do
+    pat="${pat#--exclude=}"
+    case "$pat" in
+      *\**) restic_excludes+=("--exclude=$pat") ;;
+      *)    restic_excludes+=("--exclude=$HOME_DIR/$pat") ;;
+    esac
+  done
+
+  local dry_flag=()
+  [ "$DRY_RUN" = "true" ] && dry_flag=(--dry-run)
+
+  log "Backing up $HOME_DIR with restic -> $RESTIC_REPO"
+  # --one-file-system keeps FUSE mounts (e.g. rclone) out of the snapshot
+  local rc=0
+  restic backup "${dry_flag[@]}" --one-file-system --exclude-caches \
+    "${restic_excludes[@]}" "$HOME_DIR" 2>&1 | tee -a "$LOG_FILE" || rc=$?
+  if [ "$rc" -eq 3 ]; then
+    log "restic finished with warnings (some files unreadable, rc=3); snapshot created"
+  elif [ "$rc" -ne 0 ]; then
+    log "ERROR: restic backup failed (rc=$rc)"
+    return "$rc"
+  fi
+
+  if [ "$DRY_RUN" != "true" ]; then
+    log "Applying restic retention (keep ${RESTIC_KEEP_DAILY}d/${RESTIC_KEEP_WEEKLY}w/${RESTIC_KEEP_MONTHLY}m) and pruning..."
+    restic forget --keep-daily "$RESTIC_KEEP_DAILY" --keep-weekly "$RESTIC_KEEP_WEEKLY" \
+      --keep-monthly "$RESTIC_KEEP_MONTHLY" --prune 2>&1 | tee -a "$LOG_FILE" \
+      || log "WARNING: restic forget/prune failed"
+
+    log "Verifying repository integrity (restic check)..."
+    if restic check 2>&1 | tee -a "$LOG_FILE"; then
+      log "restic check PASSED - repository integrity confirmed"
+    else
+      log "WARNING: restic check reported errors - investigate with 'restic check --read-data-subset=5%'"
+    fi
+  fi
   return 0
 }
 
@@ -226,12 +429,19 @@ export_packages() {
       dpkg-query -W -f='${binary:Package}\n' | sort -u > "$BACKUP_DIR/$PKG_LIST"
     fi
   elif is_opensuse; then
-    log "Exporting installed zypper packages (names only)..."
+    log "Exporting user-installed zypper packages (names only)..."
     if command -v zypper >/dev/null 2>&1; then
-      # Get explicitly installed packages (not auto-installed as dependencies)
-      # Leap 16+ uses different repo structure, but zypper search works the same
-      zypper search --installed-only -t package 2>/dev/null | awk -F'|' '/^i/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}' | sort -u > "$BACKUP_DIR/$PKG_LIST"
-      # Fallback to rpm if zypper output is empty
+      # Capture only EXPLICITLY user-requested packages (status "i+"), not packages
+      # auto-pulled in as dependencies. This keeps the list portable across machines:
+      # on restore, dependencies are reinstalled automatically, and hardware/firmware
+      # packages that only got pulled as deps on this box don't pollute the list.
+      zypper --quiet packages --installed-only 2>/dev/null \
+        | awk -F'|' 'NR>2 { gsub(/^[ \t]+|[ \t]+$/,"",$1); gsub(/^[ \t]+|[ \t]+$/,"",$3); if ($1 ~ /^i\+/) print $3 }' \
+        | sort -u > "$BACKUP_DIR/$PKG_LIST"
+      # Fallback 1: if the explicit-install marker yielded nothing, capture all installed
+      [ -s "$BACKUP_DIR/$PKG_LIST" ] || zypper search --installed-only -t package 2>/dev/null \
+        | awk -F'|' '/^i/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}' | sort -u > "$BACKUP_DIR/$PKG_LIST"
+      # Fallback 2: rpm if zypper output is still empty
       [ -s "$BACKUP_DIR/$PKG_LIST" ] || rpm -qa --queryformat '%{NAME}\n' | sort -u > "$BACKUP_DIR/$PKG_LIST"
     else
       log "zypper not found; using rpm -qa"
@@ -362,13 +572,220 @@ install_packages_from_list() {
         zypper_opts="--non-interactive install --no-recommends --download-in-advance"
         log "Using Leap 16+ optimizations (parallel downloads enabled)"
       fi
-      grep -E '^[^#[:space:]]' "$SRC_DIR/$PKG_LIST" | sort -u | xargs -r zypper $zypper_opts \
-        || log "Some packages failed to install; continuing."
-      log "Package restoration completed (some packages may have been skipped if unavailable)."
+      # zypper aborts the whole transaction if ANY requested package is unknown to
+      # the enabled repos. For cross-machine restore (different box, different repos)
+      # we pre-filter to packages that actually exist here, and log the rest instead
+      # of failing. This is the openSUSE equivalent of dnf's --skip-unavailable.
+      local _avail _want _install _missing
+      _avail="$(mktemp)"; _want="$(mktemp)"; _install="$(mktemp)"; _missing="$(mktemp)"
+      grep -E '^[^#[:space:]]' "$SRC_DIR/$PKG_LIST" | sort -u > "$_want"
+      zypper --quiet --no-refresh search -t package 2>/dev/null \
+        | awk -F'|' 'NR>2 { gsub(/^[ \t]+|[ \t]+$/,"",$2); if ($2!="") print $2 }' \
+        | sort -u > "$_avail"
+
+      if [ -s "$_avail" ]; then
+        comm -12 "$_want" "$_avail" > "$_install"
+        comm -23 "$_want" "$_avail" > "$_missing"
+        if [ -s "$_missing" ]; then
+          log "Skipping $(grep -c . "$_missing") package(s) not available in this machine's repos:"
+          sed 's/^/    /' "$_missing" | tee -a "$LOG_FILE"
+        fi
+      else
+        # Could not enumerate available packages; fall back to attempting them all
+        log "Warning: could not list available packages; attempting full list."
+        cp "$_want" "$_install"
+      fi
+
+      if [ -s "$_install" ]; then
+        log "Installing $(grep -c . "$_install") available package(s)..."
+        xargs -r zypper $zypper_opts < "$_install" \
+          || log "Some packages failed to install; continuing."
+      else
+        log "No requested packages are available in the current repos."
+      fi
+      rm -f "$_avail" "$_want" "$_install" "$_missing"
+      log "Package restoration completed (unavailable packages were skipped and logged)."
     else
       log "Would restore $pkg_count zypper packages"
     fi
   fi
+}
+
+# ---------- Recommends second pass ----------
+# The first package pass installs the explicit list with recommends suppressed
+# (minimal, portable). That drops optional split-out modules a package only
+# *recommends* (qemu's display/usb/spice backends, etc.). This second pass
+# reinstalls a curated set of metapackages WITHOUT suppressing recommends, so
+# zypper/apt re-pull the missing optional pieces. Scoped to RECOMMENDS_METAPKGS
+# entries that are actually present (in the backup list or already installed).
+# No-op on Fedora (its first pass already installs weak deps).
+install_recommends_metapkgs() {
+  local SRC_DIR="$1"
+  is_opensuse || is_ubuntu || return 0
+  [ -n "${RECOMMENDS_METAPKGS// /}" ] || return 0
+
+  local want=() p
+  for p in $RECOMMENDS_METAPKGS; do
+    if [ -f "$SRC_DIR/$PKG_LIST" ] && grep -qxF "$p" "$SRC_DIR/$PKG_LIST" 2>/dev/null; then
+      want+=("$p")
+    elif is_ubuntu && dpkg -s "$p" >/dev/null 2>&1; then
+      want+=("$p")
+    elif ! is_ubuntu && rpm -q "$p" >/dev/null 2>&1; then
+      want+=("$p")
+    fi
+  done
+
+  if [ "${#want[@]}" -eq 0 ]; then
+    log "Recommends second pass: no applicable metapackages; skipping."
+    return 0
+  fi
+
+  if [ "$DRY_RUN" = "true" ]; then
+    log "Would reinstall WITH recommends (restores optional modules): ${want[*]}"
+    return 0
+  fi
+
+  log "Recommends second pass: reinstalling ${want[*]} WITH recommends..."
+  if is_opensuse; then
+    zypper --non-interactive install "${want[@]}" || log "WARNING: recommends second pass had failures."
+  elif is_ubuntu; then
+    apt-get install -y "${want[@]}" || log "WARNING: recommends second pass had failures."
+  fi
+}
+
+# ---------- VM runtime dependency guarantee ----------
+# GNOME Boxes / libvirt keep their VM definitions and disk images INSIDE $HOME,
+# so a home-only restore brings the VMs back but NOT the qemu/swtpm runtime
+# packages they depend on. A fresh qemu install ships WITHOUT the optional
+# display backends (qxl, virtio-gpu) and TPM tools because those are only
+# "Recommends" (split packages), so restored VMs fail to start with errors like:
+#   "unsupported configuration: domain configuration does not support video
+#    model 'qxl'"
+# This inspects the restored libvirt domain XMLs and installs exactly the
+# backends they reference. It runs on every restore, INDEPENDENT of the full
+# package-list restore (which is often declined / home-only), and self-skips
+# when no VM definitions are present.
+ensure_vm_runtime_deps() {
+  local libvirt_qemu_dir="$HOME_DIR/.config/libvirt/qemu"
+  local boxes_img_dir="$HOME_DIR/.local/share/gnome-boxes/images"
+
+  shopt -s nullglob
+  local xmls=("$libvirt_qemu_dir"/*.xml)
+  shopt -u nullglob
+
+  if [ "${#xmls[@]}" -eq 0 ] && [ ! -d "$boxes_img_dir" ]; then
+    log "No libvirt/Boxes VM definitions found; skipping VM runtime dep check."
+    return 0
+  fi
+
+  log "Detected ${#xmls[@]} libvirt VM definition(s); ensuring qemu runtime deps..."
+
+  # Scan the restored domain XMLs for features that need optional packages.
+  # The PRIMARY video model line is the one carrying primary='yes' - this
+  # avoids false matches on virtio disk/net/memballoon devices.
+  local need_qxl=false need_virtio_gpu=false need_tpm=false need_efi=false
+  local need_smartcard=false need_usbredir=false need_spice=false
+  local x vline
+  for x in "${xmls[@]}"; do
+    vline="$(grep -E "<model type='[^']+'[^>]*primary='yes'" "$x" 2>/dev/null || true)"
+    case "$vline" in
+      *"type='qxl'"*)    need_qxl=true ;;
+      *"type='virtio'"*) need_virtio_gpu=true ;;
+    esac
+    if grep -q "<tpm" "$x" 2>/dev/null; then need_tpm=true; fi
+    if grep -Eq "firmware='efi'|/ovmf|/OVMF|pflash" "$x" 2>/dev/null; then need_efi=true; fi
+    # SPICE VMs pull in several optional qemu device backends that a fresh
+    # install omits (smartcard/ccid passthrough, usb redirection, spice chardev).
+    if grep -q "<smartcard" "$x" 2>/dev/null; then need_smartcard=true; fi
+    if grep -Eq "redirdev[^>]*type='spicevmc'" "$x" 2>/dev/null; then need_usbredir=true; fi
+    if grep -Eq "graphics type='spice'|type='spicevmc'|type='spiceport'" "$x" 2>/dev/null; then need_spice=true; fi
+  done
+
+  # Map detected features -> distro package names
+  local pkgs=()
+  if is_opensuse; then
+    pkgs+=(qemu qemu-x86 qemu-tools libvirt-daemon-qemu)
+    if $need_qxl;        then pkgs+=(qemu-hw-display-qxl); fi
+    if $need_virtio_gpu; then pkgs+=(qemu-hw-display-virtio-gpu qemu-hw-display-virtio-vga); fi
+    # openSUSE ships swtpm_setup inside the 'swtpm' package - there is NO
+    # separate swtpm-tools (zypper aborts the whole transaction on it).
+    if $need_tpm;        then pkgs+=(swtpm swtpm-selinux); fi
+    if $need_efi;        then pkgs+=(qemu-ovmf-x86_64); fi
+    if $need_smartcard;  then pkgs+=(qemu-hw-usb-smartcard); fi
+    if $need_usbredir;   then pkgs+=(qemu-hw-usb-redirect); fi
+    # qemu-ui-spice-core = the spice *display*; qemu-chardev-spice = the
+    # spicevmc/spiceport *chardev* driver used by <channel>, smartcard and
+    # usb redirdevs. Both are needed; missing the chardev gives:
+    # "'spicevmc' is not a valid char driver name".
+    if $need_spice;      then pkgs+=(qemu-ui-spice-core qemu-chardev-spice); fi
+  elif is_fedora; then
+    pkgs+=(qemu-kvm libvirt-daemon-driver-qemu)
+    if $need_qxl;        then pkgs+=(qemu-device-display-qxl); fi
+    if $need_virtio_gpu; then pkgs+=(qemu-device-display-virtio-gpu qemu-device-display-virtio-vga); fi
+    if $need_tpm;        then pkgs+=(swtpm swtpm-tools); fi
+    if $need_efi;        then pkgs+=(edk2-ovmf); fi
+    if $need_smartcard;  then pkgs+=(qemu-device-usb-smartcard); fi
+    if $need_usbredir;   then pkgs+=(qemu-device-usb-redirect); fi
+    if $need_spice;      then pkgs+=(qemu-char-spice qemu-ui-spice-core qemu-ui-spice-app); fi
+  elif is_ubuntu; then
+    # Debian/Ubuntu ship qxl + virtio display + smartcard/usbredir/spice in the
+    # monolithic qemu-system-x86 package, so only TPM/EFI need extra packages.
+    pkgs+=(qemu-system-x86 libvirt-daemon-system)
+    if $need_tpm;        then pkgs+=(swtpm swtpm-tools); fi
+    if $need_efi;        then pkgs+=(ovmf); fi
+  else
+    log "Unknown distro; cannot map VM runtime deps. Install qemu display/tpm/efi backends manually."
+    return 0
+  fi
+
+  # Deduplicate, then keep only packages that are actually missing
+  local p missing=()
+  declare -A _seen=()
+  for p in "${pkgs[@]}"; do
+    [ -n "${_seen[$p]:-}" ] && continue
+    _seen[$p]=1
+    if is_ubuntu; then
+      dpkg -s "$p" >/dev/null 2>&1 || missing+=("$p")
+    else
+      rpm -q "$p" >/dev/null 2>&1 || missing+=("$p")
+    fi
+  done
+
+  log "VM deps needed: qxl=$need_qxl virtio-gpu=$need_virtio_gpu tpm=$need_tpm efi=$need_efi smartcard=$need_smartcard usbredir=$need_usbredir spice=$need_spice"
+
+  if [ "${#missing[@]}" -eq 0 ]; then
+    log "VM runtime deps already satisfied."
+    return 0
+  fi
+
+  if [ "$DRY_RUN" = "true" ]; then
+    log "Would install missing VM runtime deps: ${missing[*]}"
+    return 0
+  fi
+
+  log "Installing missing VM runtime deps: ${missing[*]}"
+  if is_opensuse; then
+    zypper --non-interactive install "${missing[@]}" || log "WARNING: some VM runtime deps failed to install."
+  elif is_fedora; then
+    if command -v dnf5 >/dev/null 2>&1; then
+      dnf5 install -y --skip-unavailable "${missing[@]}" || log "WARNING: some VM runtime deps failed to install."
+    else
+      dnf install -y "${missing[@]}" || log "WARNING: some VM runtime deps failed to install."
+    fi
+  elif is_ubuntu; then
+    apt-get install -y "${missing[@]}" || log "WARNING: some VM runtime deps failed to install."
+  fi
+
+  # libvirt caches qemu capabilities; installing a new display module does not
+  # always invalidate that cache, so a restored VM can still see the stale
+  # "qxl unsupported" verdict. Drop the per-user cache so libvirt re-probes.
+  local caps_cache="$HOME_DIR/.cache/libvirt/qemu/capabilities"
+  if [ -d "$caps_cache" ]; then
+    log "Clearing stale libvirt qemu capabilities cache so new backends are detected."
+    rm -f "$caps_cache"/*.xml 2>/dev/null || true
+  fi
+
+  log "VM runtime dependency check complete."
 }
 
 ensure_flatpak_installed() {
@@ -444,12 +861,125 @@ capture_systemd_and_script() {
     echo "script:"
     echo "  - bin/backup_restore.sh"
     echo
-    echo "fstab suggestions (UUIDs detected dynamically at restore):"
-    echo "  UUID=<auto-detect>  $BACKUP_FSTAB_TEMPLATE"
-    echo "  $NAS_FSTAB_TEMPLATE (with uid=<auto>,gid=<auto>)"
+    if [ -d "$PRESERVE_SAVE_DIR" ]; then
+      echo "preserved system files (hand-written; a snapper rollback reverts them):"
+      sed 's/^/  - /' "$PRESERVE_SAVE_DIR/MANIFEST.txt" 2>/dev/null
+      echo
+    fi
+    echo "fstab suggestions (UUIDs/UID/GID detected dynamically at restore time):"
+    echo "  backup drive: UUID=<auto>  $BACKUP_MOUNT_POINT  $BACKUP_FSTAB_OPTIONS"
+    if [ "$NAS_ENABLED" = "true" ]; then
+      echo "  NAS share:    $NAS_SHARE  $NAS_MOUNT_POINT  $NAS_FSTAB_OPTIONS"
+    fi
+    echo
+    echo "home directory backup method:"
+    if restic_available; then
+      echo "  - restic repository at $RESTIC_REPO (dedup/compressed/encrypted)"
+      echo "  - password file: $RESTIC_PASSWORD_FILE (REQUIRED to restore)"
+    else
+      echo "  - rsync/tar snapshot under this dated dir's home/"
+    fi
   } > "$SYSTEMD_SAVE_DIR/README.txt"
 
   log "Captured systemd units and script into $SYSTEMD_SAVE_DIR and $BIN_SAVE_DIR"
+}
+
+# Capture the hand-written system files listed in PRESERVE_FILES. These belong to
+# no package (or are %config), so a snapper rollback reverts them with no warning
+# and the breakage only shows up later as a mystery fault.
+capture_preserved_files() {
+  local f mode count=0 missing=0
+
+  if [ "$DRY_RUN" = "true" ]; then
+    log "Would capture preserved system files"
+    for f in "${PRESERVE_FILES[@]}"; do
+      [ -f "$f" ] && log "  - Would copy $f"
+    done
+    return 0
+  fi
+
+  for f in "${PRESERVE_FILES[@]}"; do
+    if [ ! -f "$f" ]; then
+      missing=$((missing + 1))
+      continue
+    fi
+    mode=$(stat -c '%a' "$f")
+    install -D -m "$mode" "$f" "$PRESERVE_SAVE_DIR$f"
+    count=$((count + 1))
+  done
+
+  if [ "$count" -gt 0 ]; then
+    printf '%s\n' "${PRESERVE_FILES[@]}" > "$PRESERVE_SAVE_DIR/MANIFEST.txt"
+    log "Captured $count preserved system file(s) into $PRESERVE_SAVE_DIR"
+    # A file vanishing from the live system is exactly the failure this guards
+    # against, so say so rather than skipping in silence.
+    # NB: must be a full if, not "[ ] && log" -- as the last statement that
+    # returns 1 when nothing is missing, and set -e would abort the backup.
+    if [ "$missing" -gt 0 ]; then
+      log "  Note: $missing listed file(s) not present on this system"
+    fi
+  else
+    log "No preserved system files present to capture"
+  fi
+
+  return 0
+}
+
+# Put the captured files back and re-run whatever has to consume them.
+# Reads what is actually in the backup rather than PRESERVE_FILES, so a backup
+# taken before the list changed still restores exactly what it captured.
+restore_preserved_files() {
+  local src="${1:-$SRC_DIR/preserved}"
+  local target dest count=0
+  local need_hwdb="false" need_udev="false" need_systemd="false"
+  local need_tmpfiles="false" need_sysctl="false" need_grub="false"
+
+  [ -d "$src" ] || return 0
+
+  while IFS= read -r -d '' target; do
+    dest="${target#"$src"}"
+    log "Restoring $dest"
+    run_cmd install -D -m "$(stat -c '%a' "$target")" -o root -g root "$target" "$dest"
+    count=$((count + 1))
+    case "$dest" in
+      /etc/udev/hwdb.d/*)     need_hwdb="true"; need_udev="true" ;;
+      /etc/udev/rules.d/*)    need_udev="true" ;;
+      /etc/systemd/system/*)  need_systemd="true" ;;
+      /etc/tmpfiles.d/*)      need_tmpfiles="true" ;;
+      /etc/sysctl.d/*)        need_sysctl="true" ;;
+      /etc/default/grub)      need_grub="true" ;;
+    esac
+  done < <(find "$src" -type f ! -name 'MANIFEST.txt' -print0)
+
+  [ "$count" -eq 0 ] && return 0
+
+  if [ "$need_hwdb" = "true" ]; then
+    run_cmd systemd-hwdb update || log "Warning: systemd-hwdb update failed"
+  fi
+  if [ "$need_udev" = "true" ]; then
+    run_cmd udevadm control --reload || true
+    run_cmd udevadm trigger --action=add --subsystem-match=input || true
+    log "Note: hwdb rules apply at device-add time. Replug affected USB devices."
+  fi
+  if [ "$need_systemd" = "true" ]; then
+    run_cmd systemctl daemon-reload || log "Warning: systemctl daemon-reload failed"
+    log "Note: restored units are NOT auto-enabled. Check: systemctl status rt-audio-setup iwlwifi-recover"
+  fi
+  if [ "$need_tmpfiles" = "true" ]; then
+    run_cmd systemd-tmpfiles --create || log "Warning: systemd-tmpfiles --create failed"
+  fi
+  if [ "$need_sysctl" = "true" ]; then
+    run_cmd sysctl --system >/dev/null || log "Warning: sysctl --system failed"
+  fi
+  if [ "$need_grub" = "true" ]; then
+    # Deliberately NOT running grub2-mkconfig. Rewriting the boot config
+    # unprompted during a restore is the wrong kind of surprise, and on a
+    # different machine it could be actively harmful.
+    log "ACTION REQUIRED: /etc/default/grub restored but grub.cfg NOT regenerated."
+    log "  Review it, then run: grub2-mkconfig -o /boot/grub2/grub.cfg"
+  fi
+
+  log "Restored $count preserved system file(s)."
 }
 
 # ---------- NEW: Smart retention policy ----------
@@ -467,6 +997,12 @@ get_backup_size_gb() {
 }
 
 estimate_new_backup_size_gb() {
+  # With restic, the dated dir only holds metadata (packages/repos/units) and
+  # home goes into the deduplicated repo - incremental cost is tiny
+  if restic_available; then
+    echo 1
+    return
+  fi
   # Estimate based on home directory size plus overhead
   local home_size_kb
   home_size_kb=$(du -sk "$HOME_DIR" 2>/dev/null | awk '{print $1}')
@@ -479,7 +1015,7 @@ smart_retention_cleanup() {
   
   # Get list of existing backups sorted by age (oldest first)
   local backup_dirs
-  backup_dirs=$(find "$MOUNT_BASE/backups" -maxdepth 1 -type d -name "backup_*" -printf "%T@ %p\n" 2>/dev/null | sort -n | cut -d' ' -f2-)
+  backup_dirs=$(find "$META_BASE" -maxdepth 1 -type d -name "backup_*" -printf "%T@ %p\n" 2>/dev/null | sort -n | cut -d' ' -f2-)
   
   local backup_count
   backup_count=$(echo "$backup_dirs" | grep -c "backup_" 2>/dev/null || echo 0)
@@ -499,7 +1035,7 @@ smart_retention_cleanup() {
       }
     done
     # Refresh the list
-    backup_dirs=$(find "$MOUNT_BASE/backups" -maxdepth 1 -type d -name "backup_*" -printf "%T@ %p\n" 2>/dev/null | sort -n | cut -d' ' -f2-)
+    backup_dirs=$(find "$META_BASE" -maxdepth 1 -type d -name "backup_*" -printf "%T@ %p\n" 2>/dev/null | sort -n | cut -d' ' -f2-)
     backup_count=$(echo "$backup_dirs" | grep -c "backup_" || echo 0)
   fi
   
@@ -537,7 +1073,7 @@ smart_retention_cleanup() {
     backup_count=$((backup_count - 1))
     
     # Refresh the list
-    backup_dirs=$(find "$MOUNT_BASE/backups" -maxdepth 1 -type d -name "backup_*" -printf "%T@ %p\n" 2>/dev/null | sort -n | cut -d' ' -f2-)
+    backup_dirs=$(find "$META_BASE" -maxdepth 1 -type d -name "backup_*" -printf "%T@ %p\n" 2>/dev/null | sort -n | cut -d' ' -f2-)
   done
   
   if [ "$free_space_gb" -lt "$space_needed_gb" ]; then
@@ -749,7 +1285,7 @@ select_restore_components() {
   echo "1) Packages only"
   echo "2) Home directory only"
   echo "3) Flatpaks only"
-  echo "4) System config (repos, systemd units, fstab)"
+  echo "4) System config (repos, systemd units, preserved files, fstab)"
   echo "5) Everything (full restore)"
   echo "6) Custom selection"
   echo
@@ -808,8 +1344,10 @@ do_backup() {
   # Run smart retention cleanup BEFORE creating new backup
   smart_retention_cleanup
 
-  # Always create backup dir structure (even in dry-run) so export functions can write temp data
-  mkdir -p "$BACKUP_DIR/home"
+  # Create the dated metadata dir (even in dry-run) so export functions can write temp data.
+  # The home/ subdir is created only by the rsync fallback below; under restic, home lives
+  # in the deduplicated repo, so no empty home/ placeholder is left behind.
+  mkdir -p "$BACKUP_DIR"
   log "Detected distro: $DISTRO_ID (version: ${VERSION_ID:-unknown})"
   is_leap16_or_newer && log "Leap 16+ detected: using optimized settings (parallel downloads, SELinux support)"
   log "Starting backup to $BACKUP_DIR"
@@ -821,9 +1359,14 @@ do_backup() {
   export_flatpaks_to "$BACKUP_DIR/$FLATPAK_LIST"
 
   # Capture units, script, and fstab suggestions
+  # Before capture_systemd_and_script: its README.txt lists the manifest this writes.
+  capture_preserved_files
   capture_systemd_and_script
 
-  if is_cifs "$MOUNT_BASE"; then
+  if restic_available; then
+    backup_home_restic
+  elif is_cifs "$MOUNT_BASE"; then
+    log "restic not available - falling back to legacy backup"
     log "CIFS detected - using tar archive to preserve xattrs/ACLs/SELinux"
     # Conditionally add SELinux flag if system supports it
     local SELINUX_FLAG=""
@@ -836,6 +1379,7 @@ do_backup() {
     run_cmd tar -tf "$BACKUP_DIR/home.tar" > "$BACKUP_DIR/home.manifest" || true
   else
     require_cmd rsync
+    mkdir -p "$BACKUP_DIR/home"
     log "Backing up $HOME_DIR with rsync (preserving xattrs/ACLs)..."
     PREV="$(previous_backup_dir || true)"
     if [ -z "${PREV:-}" ]; then
@@ -868,7 +1412,7 @@ do_backup() {
     log "Backup completed successfully."
     # Final retention summary
     local final_count
-    final_count=$(find "$MOUNT_BASE/backups" -maxdepth 1 -type d -name "backup_*" | wc -l)
+    final_count=$(find "$META_BASE" -maxdepth 1 -type d -name "backup_*" | wc -l)
     local final_free_gb
     final_free_gb=$(get_free_space_gb)
     log "Final status: $final_count backups, ${final_free_gb}GB free space"
@@ -883,9 +1427,13 @@ do_restore() {
   require_mount
   log "Mount check passed"
 
+  # Fresh-machine bootstrap: if the restic repo is present but the password file
+  # isn't, prompt for it now (and persist it) so home restore + the timer work.
+  ensure_restic_password
+
   local SRC_DIR
   SRC_DIR="$(latest_backup_dir)"
-  [ -n "$SRC_DIR" ] || { log "Error: No backups found in $MOUNT_BASE/backups"; return 1; }
+  [ -n "$SRC_DIR" ] || { log "Error: No backups found in $MOUNT_BASE"; return 1; }
   log "Detected distro: $DISTRO_ID (version: ${VERSION_ID:-unknown})"
   is_leap16_or_newer && log "Leap 16+ detected: using optimized settings (parallel downloads, SELinux support)"
   log "Restoring from latest backup: $SRC_DIR"
@@ -921,6 +1469,7 @@ do_restore() {
     if [ "${ans,,}" = "y" ]; then
       restore_repos_and_keys "$SRC_DIR"
       install_packages_from_list "$SRC_DIR"
+      install_recommends_metapkgs "$SRC_DIR"
     else
       log "Package restore skipped by user."
     fi
@@ -934,7 +1483,10 @@ do_restore() {
       log "Restoring $flatpak_count flatpaks..."
       ensure_flatpak_installed
       while IFS= read -r app; do
-        [ -n "$app" ] && run_cmd flatpak install -y flathub "$app" || true
+        [ -n "$app" ] || continue
+        if ! run_cmd flatpak install -y flathub "$app"; then
+          log "  Skipped flatpak '$app' (not found on Flathub or install failed)."
+        fi
       done < "$SRC_DIR/$FLATPAK_LIST"
     else
       log "Warning: $FLATPAK_LIST not found; skipping flatpak restore."
@@ -944,7 +1496,24 @@ do_restore() {
   log "Checking home directory restore (RESTORE_HOME=$RESTORE_HOME)..."
   if [ "$RESTORE_HOME" = "true" ]; then
     log "Starting home directory restore..."
-    if [ -f "$SRC_DIR/home.tar" ]; then
+    if restic_available && restic_repo_exists; then
+      log "restic repository found at $RESTIC_REPO - restoring latest snapshot"
+      if [ "$DRY_RUN" != "true" ]; then
+        read -r -p "Restore latest restic snapshot of $HOME_DIR over current contents? [y/N]: " ans
+        if [ "${ans,,}" = "y" ]; then
+          export RESTIC_REPOSITORY="$RESTIC_REPO"
+          export RESTIC_PASSWORD_FILE
+          restic restore latest --target / --path "$HOME_DIR" 2>&1 | tee -a "$LOG_FILE"
+          log "Setting ownership..."
+          chown -R "$USER_NAME:$USER_NAME" "$HOME_DIR"
+          log "Home directory restore from restic completed."
+        else
+          log "Home restore skipped by user."
+        fi
+      else
+        log "Would restore latest restic snapshot of $HOME_DIR (restic restore latest --target / --path $HOME_DIR)"
+      fi
+    elif [ -f "$SRC_DIR/home.tar" ]; then
       log "Restoring /home from tar archive (preserves xattrs/ACLs)..."
       log "Destination: $HOME_DIR/"
 
@@ -1017,6 +1586,14 @@ do_restore() {
     fi
   fi
 
+  # Ensure the qemu/swtpm runtime backends the restored VMs need are installed.
+  # VM definitions + disk images live in $HOME, so a home-only restore can leave
+  # them unbootable without this (e.g. missing qxl display backend -> libvirt:
+  # "does not support video model 'qxl'"). Self-skips when no VMs are present.
+  if [ "$RESTORE_HOME" = "true" ] || [ "$RESTORE_PACKAGES" = "true" ]; then
+    ensure_vm_runtime_deps
+  fi
+
   # Restore systemd units + script (if present)
   if [ "$RESTORE_SYSTEM" = "true" ] && { [ -d "$SRC_DIR/systemd" ] || [ -d "$SRC_DIR/bin" ]; }; then
     log "Restoring systemd units and backup script..."
@@ -1044,6 +1621,11 @@ do_restore() {
     fi
 
     log "Systemd units and script restored."
+  fi
+
+  if [ "$RESTORE_SYSTEM" = "true" ] && [ -d "$SRC_DIR/preserved" ]; then
+    log "Restoring preserved system files..."
+    restore_preserved_files "$SRC_DIR/preserved"
   fi
 
   # PROMPT to add fstab lines (creates dirs, appends if missing, reloads, mounts)
@@ -1133,7 +1715,7 @@ show_main_menu() {
 show_backup_stats() {
   require_mount
   local backup_count
-  backup_count=$(find "$MOUNT_BASE/backups" -maxdepth 1 -type d -name "backup_*" 2>/dev/null | wc -l)
+  backup_count=$(find "$META_BASE" -maxdepth 1 -type d -name "backup_*" 2>/dev/null | wc -l)
   local free_gb
   free_gb=$(get_free_space_gb)
   local latest
@@ -1365,13 +1947,21 @@ Commands:
   menu     - Interactive menu for multiple operations (default if no command given)
   backup   - Create a new backup
              * Saves package list, repository config, GPG keys, Flatpaks
-             * Backs up home directory (rsync with hardlinks or tar for CIFS)
+             * Backs up home directory with restic (dedup, compression,
+               encryption, built-in verify) when available;
+               falls back to rsync/tar otherwise
              * Uses smart retention policy to manage disk space
              * Auto-detects Fedora, Ubuntu/Debian, and openSUSE
 
   restore  - Restore from the latest backup
-             * Restores repositories, keys, and packages
+             * Restores repositories, keys, and packages (minimal first pass,
+               then a second pass over RECOMMENDS_METAPKGS WITH recommends so
+               optional split modules like qemu's display/usb/spice backends
+               are not lost to --no-recommends)
              * Restores home directory (with ownership correction)
+             * Installs qemu/swtpm runtime backends restored libvirt/Boxes VMs
+               need (qxl/virtio-gpu display, swtpm-tools, OVMF) even on a
+               home-only restore, then clears the stale libvirt caps cache
              * Restores systemd units for automated backups
              * Optionally updates /etc/fstab for mount points
 
